@@ -1,0 +1,591 @@
+import os
+import re
+import time
+import json
+import requests
+import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
+from difflib import SequenceMatcher
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from threading import Thread
+
+APP_NAME = "OA to MAL XML"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://ogladajanime.pl/",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
+}
+
+STATUSES = [
+    "Porzucone",
+    "Wstrzymane",
+    "Planuje",
+    "Obejrzane",
+    "Oglądam",
+    "Nie oglądam",
+]
+
+STATUS_MAP = {
+    "Obejrzane": "Completed",
+    "Oglądam": "Watching",
+    "Wstrzymane": "On-Hold",
+    "Planuje": "Plan to Watch",
+    "Porzucone": "Dropped",
+    "Nie oglądam": "Dropped",
+}
+
+TYPE_TO_MAL = {
+    "tv": "1",
+    "ova": "2",
+    "movie": "3",
+    "special": "4",
+    "ona": "5",
+    "music": "6",
+}
+
+MIN_MATCH_SCORE = 0.72
+MAX_JIKAN_RETRIES = 5
+
+
+def normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_title(text: str) -> str:
+    text = text.lower().strip()
+    text = text.replace("ё", "e")
+    text = text.replace("`", "")
+    text = text.replace("’", "'")
+    text = text.replace("“", '"').replace("”", '"')
+    text = re.sub(r"\([^)]*\)", " ", text)
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, normalize_title(a), normalize_title(b)).ratio()
+
+
+def extract_user_id_from_link(link: str) -> str:
+    link = link.strip()
+    link = re.sub(r"[?#].*$", "", link).rstrip("/")
+
+    for pattern in [r"/profile/(\d+)$", r"/anime_list/(\d+)$", r"/anime_list/(\d+)/\d+$"]:
+        m = re.search(pattern, link)
+        if m:
+            return m.group(1)
+
+    raise ValueError("Podany link nie wygląda jak link do profilu lub listy ogladajanime.pl")
+
+
+def build_anime_list_urls(user_id: str) -> list[str]:
+    return [f"https://ogladajanime.pl/anime_list/{user_id}/{i}" for i in range(1, 7)]
+
+
+def download_page(url: str) -> str:
+    response = requests.get(url, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    return response.text
+
+
+def extract_lines_from_html(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+    lines = [normalize_spaces(line) for line in text.splitlines()]
+    return [line for line in lines if line]
+
+
+def find_table_start(lines: list[str]):
+    header = ["#", "Okładka", "Tytuł", "Status", "Ocena", "Postęp", "Typ"]
+    for i in range(len(lines) - len(header) + 1):
+        if lines[i:i + len(header)] == header:
+            return i + len(header)
+    return None
+
+
+def dedupe_entries(entries: list[dict]) -> list[dict]:
+    unique_entries = []
+    seen = set()
+    for entry in entries:
+        key = (
+            normalize_title(entry["title"]),
+            entry["added_at"],
+            entry["status"],
+            entry["progress_current"],
+            entry["progress_total"],
+            entry["rating"],
+            entry["type"].strip().lower(),
+        )
+        if key not in seen:
+            seen.add(key)
+            unique_entries.append(entry)
+    return unique_entries
+
+
+def parse_entries(lines: list[str]) -> list[dict]:
+    start = find_table_start(lines)
+    if start is None:
+        return []
+
+    entries = []
+    i = start
+    while i < len(lines):
+        if lines[i].startswith("Copyright"):
+            break
+
+        if not re.fullmatch(r"\d+", lines[i]):
+            i += 1
+            continue
+
+        lp = int(lines[i])
+        i += 1
+
+        if i >= len(lines):
+            break
+        title = lines[i]
+        i += 1
+
+        added_at = ""
+        if i < len(lines) and lines[i].startswith("Dodane:"):
+            added_at = lines[i].replace("Dodane:", "", 1).strip()
+            i += 1
+
+        if i + 3 >= len(lines):
+            break
+
+        status = lines[i]
+        rating_line = lines[i + 1]
+        progress_line = lines[i + 2]
+        anime_type = lines[i + 3]
+
+        if status not in STATUSES:
+            continue
+        if not re.fullmatch(r"\d+", rating_line):
+            continue
+        if not re.fullmatch(r"\d+/\d+", progress_line):
+            continue
+
+        rating = int(rating_line)
+        progress_current, progress_total = map(int, progress_line.split("/"))
+
+        entries.append({
+            "lp": lp,
+            "title": title,
+            "added_at": added_at,
+            "status": status,
+            "rating": rating,
+            "progress_current": progress_current,
+            "progress_total": progress_total,
+            "type": anime_type,
+        })
+
+        i += 4
+
+    return dedupe_entries(entries)
+
+
+def clean_search_variants(title: str) -> list[str]:
+    variants = [title]
+    for fn in [
+        lambda t: re.sub(r"\([^)]*\)", "", t).strip(),
+        lambda t: re.sub(r"\[[^\]]*\]", "", t).strip(),
+        lambda t: t.replace("(TV)", "").replace("(2023)", "").replace("(2019)", "").strip(),
+    ]:
+        v = fn(title)
+        if v:
+            variants.append(v)
+
+    out = []
+    seen = set()
+    for item in variants:
+        key = normalize_title(item)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def jikan_search(title: str, log) -> list[dict]:
+    url = "https://api.jikan.moe/v4/anime"
+    params = {"q": title, "limit": 10}
+
+    for attempt in range(MAX_JIKAN_RETRIES):
+        response = requests.get(url, params=params, headers=HEADERS, timeout=30)
+        if response.status_code == 429:
+            wait_time = 2 + attempt
+            log(f"  limit Jikan, czekam {wait_time}s...")
+            time.sleep(wait_time)
+            continue
+        response.raise_for_status()
+        data = response.json()
+        return data.get("data", [])
+    return []
+
+
+def convert_type_to_mal_code(jikan_type: str) -> str:
+    if not jikan_type:
+        return "0"
+    return TYPE_TO_MAL.get(jikan_type.strip().lower(), "0")
+
+
+def find_mal_anime(title: str, log) -> dict | None:
+    best_item = None
+    best_score = 0.0
+    best_name = ""
+
+    for variant in clean_search_variants(title):
+        results = jikan_search(variant, log)
+        for item in results:
+            names = []
+            for key in ["title", "title_english", "title_japanese"]:
+                if item.get(key):
+                    names.append(item[key])
+            for syn in item.get("title_synonyms", []):
+                if syn:
+                    names.append(syn)
+
+            local_best = 0.0
+            local_best_name = ""
+            for name in names:
+                score = similarity(title, name)
+                if score > local_best:
+                    local_best = score
+                    local_best_name = name
+
+            if local_best > best_score:
+                best_score = local_best
+                best_item = item
+                best_name = local_best_name
+
+        if best_score >= 0.95:
+            break
+
+    if best_item is None:
+        return None
+
+    return {
+        "mal_id": best_item.get("mal_id") or 0,
+        "matched_title": best_name or best_item.get("title", ""),
+        "score": best_score,
+        "series_title": best_item.get("title", title),
+        "series_type": convert_type_to_mal_code(best_item.get("type")),
+        "series_episodes": best_item.get("episodes") or 0,
+    }
+
+
+def make_cache_key(entry: dict) -> str:
+    return " | ".join([
+        normalize_title(entry["title"]),
+        str(entry["progress_current"]),
+        str(entry["progress_total"]),
+        entry["type"].strip().lower(),
+        entry["status"],
+    ])
+
+
+def load_cache(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_cache(path: str, cache: dict) -> None:
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+
+def build_xml_entries_from_cache(entries: list[dict], cache: dict, include_not_watching: bool) -> tuple[list[dict], list[str]]:
+    xml_entries = []
+    report_lines = []
+
+    for entry in entries:
+        status_pl = entry["status"]
+        if status_pl == "Nie oglądam" and not include_not_watching:
+            continue
+        mal_status = STATUS_MAP.get(status_pl)
+        if not mal_status:
+            continue
+
+        cached = cache.get(make_cache_key(entry))
+        if not cached:
+            continue
+        if cached.get("status") != "ok":
+            reason = cached.get("reason")
+            if reason:
+                report_lines.append(reason)
+            continue
+
+        match = cached["match"]
+        mal_id = int(match.get("mal_id", 0) or 0)
+        if mal_id <= 0:
+            reason = f'{entry["title"]} -> pominięte, MAL ID = 0'
+            report_lines.append(reason)
+            continue
+
+        watched = entry["progress_current"]
+        xml_entries.append({
+            "series_animedb_id": mal_id,
+            "my_watched_episodes": watched,
+            "my_start_date": "0000-00-00",
+            "my_finish_date": "0000-00-00",
+            "my_score": entry["rating"],
+            "my_status": mal_status,
+            "update_on_import": 1,
+            "my_comments": "",
+            "title": entry["title"],
+            "matched_title": match.get("series_title", ""),
+        })
+
+    return xml_entries, report_lines
+
+
+def dedupe_xml_entries(xml_entries: list[dict]) -> tuple[list[dict], list[str]]:
+    unique = []
+    seen = set()
+    report = []
+    for item in xml_entries:
+        key = (item["series_animedb_id"], item["my_status"])
+        if key in seen:
+            report.append(
+                f'{item["title"]} -> pominięte jako duplikat MAL ID/status ({item["series_animedb_id"]}, {item["my_status"]})'
+            )
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique, report
+
+
+def save_mal_minimal_xml(xml_entries: list[dict], output_file: str) -> None:
+    root = ET.Element("myanimelist")
+    myinfo = ET.SubElement(root, "myinfo")
+    ET.SubElement(myinfo, "user_export_type").text = "1"
+
+    for entry in xml_entries:
+        anime = ET.SubElement(root, "anime")
+        ET.SubElement(anime, "series_animedb_id").text = str(entry["series_animedb_id"])
+        ET.SubElement(anime, "my_watched_episodes").text = str(entry["my_watched_episodes"])
+        ET.SubElement(anime, "my_start_date").text = entry["my_start_date"]
+        ET.SubElement(anime, "my_finish_date").text = entry["my_finish_date"]
+        ET.SubElement(anime, "my_score").text = str(entry["my_score"])
+        ET.SubElement(anime, "my_status").text = entry["my_status"]
+        ET.SubElement(anime, "update_on_import").text = "1"
+        ET.SubElement(anime, "my_comments").text = entry["my_comments"]
+
+    tree = ET.ElementTree(root)
+    try:
+        ET.indent(tree, space="  ", level=0)
+    except AttributeError:
+        pass
+    tree.write(output_file, encoding="utf-8", xml_declaration=True)
+
+
+def save_report(path: str, lines: list[str]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        if not lines:
+            f.write("Brak problemów do zgłoszenia.\n")
+            return
+        for line in lines:
+            f.write(line + "\n")
+
+
+def generate_xml(profile_link: str, output_dir: str, include_not_watching: bool, log) -> tuple[str, str, str]:
+    user_id = extract_user_id_from_link(profile_link)
+    os.makedirs(output_dir, exist_ok=True)
+
+    xml_path = os.path.join(output_dir, f"oatomal_{user_id}.xml")
+    report_path = os.path.join(output_dir, f"oatomal_{user_id}_report.txt")
+    cache_path = os.path.join(output_dir, f"oatomal_{user_id}_cache.json")
+
+    urls = build_anime_list_urls(user_id)
+    best_entries = []
+    best_url = None
+
+    for url in urls:
+        log(f"Sprawdzam: {url}")
+        html = download_page(url)
+        lines = extract_lines_from_html(html)
+        entries = parse_entries(lines)
+        valid_statuses = [e for e in entries if e["status"] in STATUS_MAP or (include_not_watching and e["status"] == "Nie oglądam")]
+        log(f"  wszystkie wpisy: {len(entries)} | do eksportu: {len(valid_statuses)}")
+        if len(valid_statuses) > len(best_entries):
+            best_entries = valid_statuses
+            best_url = url
+
+    if not best_entries:
+        raise RuntimeError("Nie udało się znaleźć listy anime do eksportu.")
+
+    status_counts = {}
+    for entry in best_entries:
+        status_counts[entry["status"]] = status_counts.get(entry["status"], 0) + 1
+
+    log(f"Wybrana lista: {best_url}")
+    log(f"Łącznie do przetworzenia: {len(best_entries)}")
+    log("Rozkład statusów: " + ", ".join(f"{k}={v}" for k, v in sorted(status_counts.items())))
+    cache = load_cache(cache_path)
+    report_lines = []
+
+    for idx, entry in enumerate(best_entries, start=1):
+        title = entry["title"]
+        key = make_cache_key(entry)
+        log(f"[{idx}/{len(best_entries)}] {title}")
+
+        if key in cache:
+            log("  pomijam, już jest w cache")
+            continue
+
+        match = find_mal_anime(title, log)
+        if match is None:
+            reason = f"{title} -> brak wyników w MAL"
+            cache[key] = {"status": "not_found", "reason": reason}
+            report_lines.append(reason)
+            save_cache(cache_path, cache)
+            continue
+
+        if int(match.get("mal_id", 0) or 0) <= 0:
+            reason = f"{title} -> MAL ID = 0"
+            cache[key] = {"status": "not_found", "reason": reason}
+            report_lines.append(reason)
+            save_cache(cache_path, cache)
+            continue
+
+        if match["score"] < MIN_MATCH_SCORE:
+            reason = f'{title} -> słabe dopasowanie: "{match["matched_title"]}" (score={match["score"]:.2f})'
+            cache[key] = {"status": "weak_match", "reason": reason}
+            report_lines.append(reason)
+            save_cache(cache_path, cache)
+            continue
+
+        cache[key] = {"status": "ok", "match": match}
+        save_cache(cache_path, cache)
+        log(f'  OK -> {match["series_title"]} ({match["score"]:.2f})')
+
+    xml_entries, cache_report = build_xml_entries_from_cache(best_entries, cache, include_not_watching)
+    report_lines.extend(cache_report)
+    xml_entries, dedupe_report = dedupe_xml_entries(xml_entries)
+    report_lines.extend(dedupe_report)
+
+    if not xml_entries:
+        raise RuntimeError("Nie udało się zbudować żadnego poprawnego wpisu do XML.")
+
+    log(f"Wpisów zapisanych do XML: {len(xml_entries)}")
+    if report_lines:
+        log(f"Pominiętych / problematycznych: {len(report_lines)}")
+    save_mal_minimal_xml(xml_entries, xml_path)
+    save_report(report_path, report_lines)
+    return xml_path, report_path, cache_path
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        self.geometry("820x620")
+        self.resizable(True, True)
+        self._build_ui()
+
+    def _build_ui(self):
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Link do profilu OgladajAnime:").pack(anchor="w")
+        self.link_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.link_var).pack(fill="x", pady=(4, 12))
+
+        out_row = ttk.Frame(frame)
+        out_row.pack(fill="x", pady=(0, 12))
+        ttk.Label(out_row, text="Folder zapisu:").pack(anchor="w")
+        self.out_var = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop"))
+        ttk.Entry(out_row, textvariable=self.out_var).pack(side="left", fill="x", expand=True, pady=(4, 0))
+        ttk.Button(out_row, text="Wybierz...", command=self.choose_dir).pack(side="left", padx=(8, 0), pady=(4, 0))
+
+        self.include_not_watching = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            frame,
+            text="Importuj status 'Nie oglądam' jako Dropped",
+            variable=self.include_not_watching,
+        ).pack(anchor="w", pady=(0, 12))
+
+        self.btn = ttk.Button(frame, text="Generuj XML", command=self.start_generation)
+        self.btn.pack(anchor="w")
+
+        self.status_var = tk.StringVar(value="Gotowe do działania.")
+        ttk.Label(frame, textvariable=self.status_var).pack(anchor="w", pady=(12, 8))
+
+        self.log_box = tk.Text(frame, height=24, wrap="word")
+        self.log_box.pack(fill="both", expand=True)
+        self.log_box.configure(state="disabled")
+
+    def choose_dir(self):
+        path = filedialog.askdirectory(initialdir=self.out_var.get() or os.path.expanduser("~"))
+        if path:
+            self.out_var.set(path)
+
+    def log(self, message: str):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", message + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+        self.update_idletasks()
+
+    def set_status(self, message: str):
+        self.status_var.set(message)
+        self.update_idletasks()
+
+    def start_generation(self):
+        link = self.link_var.get().strip()
+        out_dir = self.out_var.get().strip()
+        if not link:
+            messagebox.showerror(APP_NAME, "Wklej link do profilu OgladajAnime.")
+            return
+        if not out_dir:
+            messagebox.showerror(APP_NAME, "Wybierz folder zapisu.")
+            return
+
+        self.btn.configure(state="disabled")
+        self.set_status("Trwa generowanie XML...")
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", "end")
+        self.log_box.configure(state="disabled")
+
+        def worker():
+            try:
+                xml_path, report_path, cache_path = generate_xml(
+                    profile_link=link,
+                    output_dir=out_dir,
+                    include_not_watching=self.include_not_watching.get(),
+                    log=lambda msg: self.after(0, self.log, msg),
+                )
+                self.after(0, self.set_status, "Gotowe.")
+                self.after(0, self.log, "")
+                self.after(0, self.log, f"XML: {xml_path}")
+                self.after(0, self.log, f"Raport: {report_path}")
+                self.after(0, self.log, f"Cache: {cache_path}")
+                self.after(0, lambda: messagebox.showinfo(APP_NAME, f"Gotowe.\n\nXML:\n{xml_path}"))
+            except Exception as e:
+                self.after(0, self.set_status, "Wystąpił błąd.")
+                self.after(0, self.log, f"Błąd: {e}")
+                self.after(0, lambda: messagebox.showerror(APP_NAME, str(e)))
+            finally:
+                self.after(0, lambda: self.btn.configure(state="normal"))
+
+        Thread(target=worker, daemon=True).start()
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
